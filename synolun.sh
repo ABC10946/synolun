@@ -183,6 +183,133 @@ cmd_delete() {
   done
 }
 
+target_list_json() {
+  local resp
+  resp=$(api_post "SYNO.Core.ISCSI.Target" 1 list \
+    --data-urlencode 'additional=["mapped_lun","status","connected_sessions"]')
+  if ! json_success "$resp"; then
+    echo "Target list failed: $resp" >&2
+    exit 1
+  fi
+  echo "$resp"
+}
+
+cmd_targets() {
+  local orphans=0
+  case "${1:-}" in
+    --orphans) orphans=1 ;;
+    "") ;;
+    *) echo "usage: $0 targets [--orphans]" >&2; exit 1 ;;
+  esac
+
+  local resp
+  resp=$(target_list_json)
+  python3 -c '
+import json, sys
+targets = json.loads(sys.argv[1])["data"]["targets"]
+orphans = sys.argv[2] == "1"
+fmt = "{:>4} {:<52} {:>5} {:>8} {}"
+print(fmt.format("ID", "NAME", "LUNS", "SESSIONS", "STATUS"))
+for t in targets:
+    luns = len(t.get("mapped_luns", []))
+    sessions = len(t.get("connected_sessions", []))
+    if orphans and (luns or sessions):
+        continue
+    print(fmt.format(t.get("target_id",""), t.get("name",""), luns, sessions, t.get("status","")))
+' "$resp" "$orphans"
+}
+
+cmd_target_delete() {
+  local yes=0
+  local ids=()
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) yes=1 ;;
+      *) ids+=("$arg") ;;
+    esac
+  done
+  [ "${#ids[@]}" -ge 1 ] || { echo "usage: $0 target-delete [-y] <target_id> [target_id...]" >&2; exit 1; }
+
+  # Refuse targets that still have LUNs mapped or initiators connected.
+  local resp blocked
+  resp=$(target_list_json)
+  blocked=$(python3 -c '
+import json, sys
+targets = {str(t["target_id"]): t for t in json.loads(sys.argv[1])["data"]["targets"]}
+for i in sys.argv[2:]:
+    t = targets.get(i)
+    if t is None:
+        print(f"{i}: not found")
+    elif t.get("mapped_luns") or t.get("connected_sessions"):
+        print(i + " (" + t.get("name", "") + "): has mapped LUNs or connected sessions")
+' "$resp" "${ids[@]}")
+  if [ -n "$blocked" ]; then
+    echo "Refusing to delete:" >&2
+    echo "$blocked" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  if [ "$yes" -ne 1 ]; then
+    echo "About to delete ${#ids[@]} target(s):"
+    printf '  %s\n' "${ids[@]}"
+    read -r -p "Type 'yes' to proceed: " confirm
+    [ "$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
+  fi
+
+  for id in "${ids[@]}"; do
+    resp=$(api_post "SYNO.Core.ISCSI.Target" 1 delete --data-urlencode "target_id=\"${id}\"")
+    if json_success "$resp"; then
+      echo "deleted: target $id"
+    else
+      echo "FAILED:  target $id -> $resp" >&2
+    fi
+  done
+}
+
+cmd_help() {
+  cat <<EOF
+synolun.sh - CLI for Synology DSM iSCSI LUN management via the DSM Web API
+(the same API synology-csi uses: SYNO.Core.ISCSI.LUN)
+
+Usage:
+  $0 <command> [args]
+
+Commands:
+  login <account>          Log in and cache the session (prompts for password)
+  logout                   Invalidate and remove the cached session
+  list                     List all LUNs (uuid, name, size, mapped, status)
+  get <uuid>               Show full detail for one LUN
+  delete [-y] <uuid>...    Delete one or more LUNs (prompts for confirmation
+                           unless -y/--yes is given)
+  targets [--orphans]      List iSCSI targets (id, name, mapped LUN count,
+                           connected sessions, status); --orphans shows only
+                           targets with no LUNs and no sessions
+  target-delete [-y] <id>...
+                           Delete one or more iSCSI targets by target_id.
+                           Refuses targets with mapped LUNs or sessions.
+  help                     Show this help
+
+Environment variables:
+  DSM_HOST      required, e.g. 192.168.10.50
+  DSM_PORT      DSM port (default: 5000)
+  DSM_SCHEME    http or https (default: http; use https for port 5001)
+  DSM_INSECURE  set to 1 to skip TLS certificate verification (self-signed certs)
+
+Session:
+  The session (base URL + sid) is cached in
+    ${SESSION_FILE}
+  (mode 600) so login is only needed once per shell session, until the sid
+  expires or 'logout' is run.
+
+Examples:
+  DSM_HOST=192.168.10.50 $0 login admin
+  $0 list
+  $0 get 12345678-90ab-cdef-1234-567890abcdef
+  $0 delete -y 12345678-90ab-cdef-1234-567890abcdef
+  DSM_HOST=nas.example.com DSM_SCHEME=https DSM_PORT=5001 DSM_INSECURE=1 $0 list
+EOF
+}
+
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
@@ -191,8 +318,12 @@ main() {
     list)    cmd_list "$@" ;;
     get)     cmd_get "$@" ;;
     delete)  cmd_delete "$@" ;;
+    targets) cmd_targets "$@" ;;
+    target-delete) cmd_target_delete "$@" ;;
+    help|-h|--help|"") cmd_help ;;
     *)
-      echo "usage: $0 {login|logout|list|get|delete} ..." >&2
+      echo "unknown command: $cmd" >&2
+      echo "usage: $0 {login|logout|list|get|delete|targets|target-delete|help} ..." >&2
       exit 1
       ;;
   esac
